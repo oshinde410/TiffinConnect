@@ -688,17 +688,23 @@ function App() {
                   </div>
 
                   <div className="forecast-box">
-                    <strong>{dashboard.demand.suggested_preparation} bowls</strong>
-                    <span>Suggested prep for upcoming week</span>
-                    <div className="forecast-days">
-                      {(dashboard.demand.forecast || []).map((day) => (
-                        <div key={day.day}>
-                          <span>{day.day}</span>
-                          <strong>{day.predicted_orders}</strong>
+                    {dashboard.demand.enabled === false ? (
+                      <strong>Forecast unavailable</strong>
+                    ) : (
+                      <>
+                        <strong>{dashboard.demand.suggested_preparation} bowls</strong>
+                        <span>Suggested prep for upcoming week</span>
+                        <div className="forecast-days">
+                          {(dashboard.demand.forecast || []).map((day) => (
+                            <div key={day.day}>
+                              <span>{day.day}</span>
+                              <strong>{day.predicted_orders}</strong>
+                            </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-                    <small>7-day holdout MAE: {dashboard.demand.holdout_mae} orders</small>
+                        <small>7-day holdout MAE: {dashboard.demand.holdout_mae} orders</small>
+                      </>
+                    )}
                     <p>{dashboard.demand.explanation}</p>
                   </div>
                 </>

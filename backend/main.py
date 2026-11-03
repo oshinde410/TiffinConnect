@@ -4,7 +4,7 @@ import json
 import math
 import os
 import random
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal
 
@@ -19,22 +19,72 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, create_engine, func, update
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, create_engine, func, text, update
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
-from tensorflow import keras
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "tiffinconnect.db"
-MODEL_DIR = BASE_DIR / "models"
+MODEL_DIR = Path(os.getenv("MODEL_DIR", str(BASE_DIR / "models")))
 MODEL_PATH = MODEL_DIR / "demand_lstm_v2.keras"
 SCALER_PATH = MODEL_DIR / "demand_scaler_v2.joblib"
-SECRET_KEY = os.getenv(
-    "TIFFIN_SECRET",
-    "tiffinconnect-local-demo-secret-change-this-before-deployment",
-)
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+SECRET_KEY = os.getenv("TIFFIN_SECRET", "")
+if not SECRET_KEY:
+    if IS_PRODUCTION:
+        raise RuntimeError("TIFFIN_SECRET must be set in production.")
+    SECRET_KEY = "tiffinconnect-local-demo-secret-change-this-before-deployment"
 if len(SECRET_KEY.encode("utf-8")) < 32:
     raise RuntimeError("TIFFIN_SECRET must contain at least 32 bytes.")
 ALGORITHM = "HS256"
+ENABLE_DEMAND_FORECAST = os.getenv(
+    "ENABLE_DEMAND_FORECAST",
+    "false" if IS_PRODUCTION else "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+SEED_DEMO_DATA = os.getenv(
+    "SEED_DEMO_DATA",
+    "false" if IS_PRODUCTION else "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+if IS_PRODUCTION and SEED_DEMO_DATA:
+    raise RuntimeError("SEED_DEMO_DATA must be disabled in production.")
+
+configured_origins = os.getenv("CORS_ORIGINS")
+if configured_origins:
+    CORS_ORIGINS = [origin.strip().rstrip("/") for origin in configured_origins.split(",") if origin.strip()]
+elif IS_PRODUCTION:
+    raise RuntimeError("Set CORS_ORIGINS to the deployed frontend origin in production.")
+else:
+    CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if IS_PRODUCTION and "*" in CORS_ORIGINS:
+    raise RuntimeError("CORS_ORIGINS must not contain a wildcard in production.")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL:
+    if IS_PRODUCTION and not DATABASE_URL.startswith(
+        ("postgres://", "postgresql://", "postgresql+psycopg://")
+    ):
+        raise RuntimeError("Production DATABASE_URL must use PostgreSQL.")
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+    elif DATABASE_URL.startswith("postgresql://"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+    engine_options: Dict[str, Any] = {
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    }
+    if DATABASE_URL.startswith("postgresql+psycopg://"):
+        engine_options["connect_args"] = {"prepare_threshold": None}
+    elif DATABASE_URL.startswith("sqlite"):
+        engine_options["connect_args"] = {"check_same_thread": False}
+    engine = create_engine(DATABASE_URL, **engine_options)
+elif IS_PRODUCTION:
+    raise RuntimeError("DATABASE_URL must point to a persistent PostgreSQL database in production.")
+else:
+    engine = create_engine(
+        f"sqlite:///{DB_PATH}",
+        connect_args={"check_same_thread": False},
+        pool_pre_ping=True,
+    )
 
 pwd_context = CryptContext(schemes=["bcrypt_sha256", "bcrypt"], deprecated="auto")
 security = HTTPBearer()
@@ -44,7 +94,6 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
@@ -164,13 +213,15 @@ class OrderStatusInput(BaseModel):
     status: Literal["confirmed", "in_transit", "delivered", "cancelled"]
 
 
-app = FastAPI(title="TiffinConnect API", version="1.0.0")
+app = FastAPI(
+    title="TiffinConnect API",
+    version="1.0.0",
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -194,7 +245,12 @@ def verify_password(password: str, hashed_password: str) -> bool:
 
 
 def create_token(user: User) -> str:
-    payload = {"sub": str(user.id), "role": user.role, "email": user.email}
+    payload = {
+        "sub": str(user.id),
+        "role": user.role,
+        "email": user.email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=7),
+    }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -464,21 +520,55 @@ def seed_demo_data(db: Session) -> None:
     db.commit()
 
 
-Base.metadata.create_all(bind=engine)
+def bootstrap_admin(db: Session) -> None:
+    email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+    password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+    if bool(email) != bool(password):
+        raise RuntimeError(
+            "Set both BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD to create the initial admin."
+        )
+    if not email:
+        return
+    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+        raise RuntimeError("BOOTSTRAP_ADMIN_EMAIL must be a valid email address.")
+    if len(password) < 12:
+        raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must contain at least 12 characters.")
+
+    admin = db.query(User).filter(User.email == email).first()
+    if admin:
+        if admin.role != "admin":
+            raise RuntimeError("BOOTSTRAP_ADMIN_EMAIL is already assigned to a non-admin account.")
+        return
+    db.add(
+        User(
+            name=os.getenv("BOOTSTRAP_ADMIN_NAME", "").strip() or "TiffinConnect Admin",
+            email=email,
+            hashed_password=hash_password(password),
+            role="admin",
+            hostel="Admin Office",
+            budget=0,
+            veg_preference="vegetarian",
+            favorite_meal="",
+        )
+    )
+    db.commit()
 
 
 @app.on_event("startup")
 def startup_event() -> None:
     db = SessionLocal()
     try:
-        seed_demo_data(db)
-        ensure_lstm_model_exists(force=False)
+        Base.metadata.create_all(bind=engine)
+        if SEED_DEMO_DATA:
+            seed_demo_data(db)
+        bootstrap_admin(db)
     finally:
         db.close()
 
 
 @app.get("/api/health")
-def health() -> Dict[str, Any]:
+def health(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    db.execute(text("SELECT 1"))
     return {"status": "ok", "message": "TiffinConnect backend is online."}
 
 
@@ -748,6 +838,11 @@ def admin_dashboard(db: Session = Depends(get_db), current_user: User = Depends(
 def demand_prediction(db: Session = Depends(get_db), current_user: User = Depends(require_current_user)) -> Dict[str, Any]:
     if current_user.role not in {"cook", "admin"}:
         raise HTTPException(status_code=403, detail="This feature is available to cooks and admins.")
+    if not ENABLE_DEMAND_FORECAST:
+        raise HTTPException(
+            status_code=503,
+            detail="Demand forecasting is disabled on this deployment. Enable the ML dependencies and set ENABLE_DEMAND_FORECAST=true.",
+        )
     return build_demand_prediction_payload()
 
 
@@ -820,7 +915,14 @@ def build_dashboard_for_role(db: Session, current_user: User) -> Dict[str, Any]:
             )
             if sold > 0:
                 popular.append({"name": meal.name, "sold": sold})
-        demand = build_demand_prediction_payload()
+        demand = (
+            build_demand_prediction_payload()
+            if ENABLE_DEMAND_FORECAST
+            else {
+                "enabled": False,
+                "explanation": "Forecasting is disabled on this resource-constrained deployment. Enable the ML dependencies and set ENABLE_DEMAND_FORECAST=true on a service with sufficient memory.",
+            }
+        )
         return {
             "summary": {
                 "todayOrders": today_orders,
@@ -882,11 +984,22 @@ def generate_synthetic_demand_series(days: int = 180) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def get_keras():
+    try:
+        from tensorflow import keras
+    except ImportError as exc:
+        raise RuntimeError(
+            "Demand forecasting dependencies are not installed. Install backend/requirements-ml.txt."
+        ) from exc
+    return keras
+
+
 def ensure_lstm_model_exists(force: bool = False) -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     if not force and MODEL_PATH.exists() and SCALER_PATH.exists():
         return
 
+    keras = get_keras()
     df = generate_synthetic_demand_series(180)
     sequence_length = 14
     features = df[["orders", "day_of_week", "weekend", "festival", "weather_index"]]
@@ -919,8 +1032,9 @@ def ensure_lstm_model_exists(force: bool = False) -> None:
     joblib.dump(scaler, SCALER_PATH)
 
 
-def load_lstm_components() -> tuple[keras.Model, MinMaxScaler]:
+def load_lstm_components() -> tuple[Any, MinMaxScaler]:
     ensure_lstm_model_exists(force=False)
+    keras = get_keras()
     model = keras.models.load_model(MODEL_PATH)
     scaler = joblib.load(SCALER_PATH)
     return model, scaler
